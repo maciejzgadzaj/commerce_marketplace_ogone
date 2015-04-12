@@ -1,0 +1,6 @@
+name = Ogone
+description = Adapts Commerce Ogone features for Commerce Marketplace.
+package = Commerce Marketplace (contrib)
+dependencies[] = commerce_ogone
+dependencies[] = commerce_payment
+core = 7.x
