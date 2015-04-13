@@ -199,9 +199,6 @@ function commerce_marketplace_ogone_menu_alter(&$items) {
 function commerce_marketplace_ogone_callback() {
   // Load order and payment_method objects
   if ($feedback = commerce_ogone_get_feedback()) {
-    watchdog('ogone', 'commerce_marketplace_ogone_callback feedback : !feedback', array(
-      '!feedback' => '<pre>' . var_export($feedback, TRUE) . '</pre>',
-    ), WATCHDOG_DEBUG);
     $order_ids = explode('-', $feedback['ORDERID']);
     $orders = commerce_order_load_multiple($order_ids);
     if (!empty($orders)) {
