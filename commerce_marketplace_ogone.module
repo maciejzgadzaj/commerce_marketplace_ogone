@@ -7,6 +7,10 @@
 /**
  * Implements hook_commerce_ogone_data_alter().
  *
+ * Alters data being sent to Ogone when requesting payment:
+ * - ORDERID value to send IDs of all orders from the current order group,
+ * - AMOUNT to request payment for total of all orders from the order group.
+ *
  * @param array $data
  *   Array of data to be sent to Ogone in payment request.
  * @param object $order
@@ -31,6 +35,11 @@ function commerce_marketplace_ogone_commerce_ogone_data_alter(&$data, $order, $s
   $total = commerce_marketplace_order_calculate_total($orders);
   $data['AMOUNT'] = $total['amount'];
 }
+
+
+////////////////////////////////////////////////////////////////////////////
+// Code for processing transaction feedback sent on the redirection URLs. //
+////////////////////////////////////////////////////////////////////////////
 
 /**
  * Implements hook_commerce_payment_method_info_alter().
@@ -178,6 +187,11 @@ function commerce_marketplace_ogone_get_payment_transaction($order, $feedback) {
   }
   return FALSE;
 }
+
+
+///////////////////////////////////////////////////////////////
+// Code for processing Direct HTTP server-to-server request. //
+///////////////////////////////////////////////////////////////
 
 /**
  * Implements hook_menu_alter().
