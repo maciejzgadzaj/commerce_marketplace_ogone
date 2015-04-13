@@ -1,0 +1,221 @@
+<?php
+/**
+ * @file
+ * Adapts Commerce Ogone features for Commerce Marketplace.
+ */
+
+/**
+ * Implements hook_commerce_ogone_data_alter().
+ *
+ * @param array $data
+ *   Array of data to be sent to Ogone in payment request.
+ * @param object $order
+ *   The loaded order that is being processed.
+ * @param array $settings
+ *   The payment method settings.
+ *
+ * @see commerce_ogone_build_redirect_form()
+ */
+function commerce_marketplace_ogone_commerce_ogone_data_alter(&$data, $order, $settings) {
+  // Marketplace-specific: load all orders from the current order group
+  // (for all vendors) and update request ORDERID value with IDs of all orders.
+  $orders = commerce_order_load_multiple(NULL, array('order_group' => $order->order_group), TRUE);
+  // We are using order IDs here instead of order numbers, as this way we can
+  // be sure that we always have to deal with integers, which could be easily
+  // split by separating dashes when receiving callback from Ogone
+  // (see commerce_marketplace_ogone_callback()).
+  ksort($orders);
+  $data['ORDERID'] = implode('-', array_keys($orders));
+
+  // Calculate total amount for all orders and update it in Ogone request.
+  $total = commerce_marketplace_order_calculate_total($orders);
+  $data['AMOUNT'] = $total['amount'];
+}
+
+/**
+ * Implements hook_commerce_payment_method_info_alter().
+ *
+ * @see commerce_ogone_commerce_payment_method_info()
+ */
+function commerce_marketplace_ogone_commerce_payment_method_info_alter(&$payment_methods) {
+  if (isset($payment_methods['ogone'])) {
+    // Marketplace-specific: use custom form validation callback so that
+    // we can process Ogone feedback and create payment transactions for each
+    // order from the order group.
+    $payment_methods['ogone']['callbacks']['redirect_form_validate'] = 'commerce_marketplace_ogone_redirect_form_validate';
+  }
+}
+
+/**
+ * Implements hook_redirect_form_validate().
+ *
+ * This function overrides both commerce_ogone_redirect_form_validate()
+ * and commerce_ogone_process_callback() at the same time.
+ *
+ * Considering that commerce_ogone_redirect_form_validate() does not do anything
+ * else except calling commerce_ogone_process_callback(), and also that
+ * commerce_ogone_process_callback() is not being called from anywhere else in
+ * Commerce Ogone module, we have merged these two functions here.
+ *
+ * The only difference between original commerce_ogone_process_callback() and
+ * this one is that here we call commerce_marketplace_ogone_process_transaction()
+ * instead of original commerce_ogone_process_transaction().
+ *
+ * @param object $order
+ *   The loaded order that is being processed.
+ * @param array $payment_method
+ *   The payment method settings.
+ *
+ * @see commerce_ogone_redirect_form_validate()
+ * @see commerce_ogone_process_callback()
+ */
+function commerce_marketplace_ogone_redirect_form_validate($order, $payment_method) {
+  if ($feedback = commerce_ogone_get_feedback()) {
+    if (commerce_ogone_valid_sha1_callback($order, $payment_method, $feedback)) {
+      // Process the transaction based on the Ogone parameters received.
+      // Marketplace-specific: use commerce_marketplace_ogone_process_transaction()
+      // instead of original commerce_ogone_process_transaction().
+      commerce_marketplace_ogone_process_transaction($order, $payment_method, $feedback);
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Process the payment transaction with the info received from Ogone.
+ *
+ * Overrides original commerce_ogone_process_transaction(). This function is
+ * almost identical to the original version, with the only difference being
+ * that here we use commerce_marketplace_ogone_get_payment_transaction()
+ * instead of original commerce_ogone_get_payment_transaction(), to add
+ * and extra condition on order_id when looking for already existing
+ * payment transaction.
+ *
+ * @param object $order
+ *   The loaded order that is being processed.
+ * @param array $payment_method
+ *   The payment method settings.
+ * @param array $feedback
+ *   The parameters received from Ogone regarding the payment.
+ * @param bool $redirect
+ *   Specifies whether to call redirect functions or not.
+ *
+ * @see commerce_marketplace_ogone_get_payment_transaction()
+ * @see commerce_ogone_get_payment_transaction()
+ */
+function commerce_marketplace_ogone_process_transaction($order, $payment_method, $feedback, $redirect = TRUE) {
+  // Marketplace-specific: call commerce_marketplace_ogone_get_payment_transaction()
+  // instead of original commerce_ogone_get_payment_transaction() to add an extra
+  // condition on order_id when looking for already existing payment transaction.
+  $transaction_id = commerce_marketplace_ogone_get_payment_transaction($order, $feedback);
+  if (!$transaction_id) {
+    $transaction = commerce_payment_transaction_new('ogone', $order->order_id);
+  }
+  else {
+    $transaction = commerce_payment_transaction_load($transaction_id);
+  }
+
+  $payment_status = commerce_ogone_feedback_status($feedback['STATUS']);
+
+  // identifying data
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->remote_id = $feedback['PAYID'];
+  // payment amount details
+  $transaction->currency_code = $feedback['CURRENCY'];
+  $feedback_amount = commerce_currency_decimal_to_amount($feedback['AMOUNT'], $feedback['CURRENCY']);
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $order_amount = $wrapper->commerce_order_total->amount->value();
+
+  $transaction->amount = ($feedback_amount > $order_amount) ? $order_amount : $feedback_amount;
+  // payment status
+  $transaction->remote_status = $feedback['STATUS'];
+  $transaction->status = $payment_status['code'];
+  $transaction->message = $payment_status['message'];
+  $transaction->payload = $feedback;
+  commerce_payment_transaction_save($transaction);
+  if ($redirect) {
+    if ($payment_status['code'] == COMMERCE_PAYMENT_STATUS_FAILURE) {
+      commerce_payment_redirect_pane_previous_page($order);
+    }
+    else {
+      commerce_payment_redirect_pane_next_page($order);
+    }
+  }
+}
+
+/**
+ * Get transaction with a specific Ogone PAYID.
+ *
+ * Overrides commerce_ogone_get_payment_transaction(), adding additional
+ * condition on order_id when looking for already existing transaction.
+ * We need to do it as actually we are creating multiple commerce payment
+ * transactions from one Ogone authorisation/debit - one transaction
+ * for each order from the order group.
+ *
+ * @param object $order
+ *   The loaded order that is being processed.
+ * @param array $feedback
+ *   The parameters received from Ogone regarding the payment.
+ *
+ * @see commerce_ogone_get_payment_transaction()
+ */
+function commerce_marketplace_ogone_get_payment_transaction($order, $feedback) {
+  $feedback_remote_id = $feedback['PAYID'];
+  $query = new EntityFieldQuery;
+
+  $result = $query
+    ->entityCondition('entity_type', 'commerce_payment_transaction')
+    ->propertyCondition('payment_method', 'ogone')
+    ->propertyCondition('remote_id', $feedback_remote_id)
+    // Marketplace-specific: new condition on order_id added.
+    ->propertyCondition('order_id', $order->order_id)
+    ->execute();
+  if (isset($result['commerce_payment_transaction']) && count($result['commerce_payment_transaction']) > 0) {
+    $transaction = array_pop($result['commerce_payment_transaction']);
+    return $transaction->transaction_id;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_menu_alter().
+ *
+ * @see commerce_ogone_menu()
+ */
+function commerce_marketplace_ogone_menu_alter(&$items) {
+  $items['commerce-ogone/callback']['page callback'] = 'commerce_marketplace_ogone_callback';
+}
+
+/**
+ * Menu callback handler for Ogone Direct HTTP server-to-server request.
+ *
+ * Overrides commerce_ogone_callback() to make it work with Marketplace's
+ * multiple orders.
+ *
+ * @see commerce_ogone_callback()
+ */
+function commerce_marketplace_ogone_callback() {
+  // Load order and payment_method objects
+  if ($feedback = commerce_ogone_get_feedback()) {
+    watchdog('ogone', 'commerce_marketplace_ogone_callback feedback : !feedback', array(
+      '!feedback' => '<pre>' . var_export($feedback, TRUE) . '</pre>',
+    ), WATCHDOG_DEBUG);
+    $order_ids = explode('-', $feedback['ORDERID']);
+    $orders = commerce_order_load_multiple($order_ids);
+    if (!empty($orders)) {
+      foreach ($orders as $order) {
+        // Load the payment method, since it won't be available if no $order object was passed in as argument
+        $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+        if (!$payment_method || $payment_method['method_id'] != 'ogone') {
+          continue;
+        }
+        if (commerce_ogone_valid_sha1_callback($order, $payment_method, $feedback)) {
+          commerce_marketplace_ogone_process_transaction($order, $payment_method, $feedback);
+        }
+      }
+    }
+  }
+  return FALSE;
+}
