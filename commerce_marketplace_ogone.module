@@ -21,19 +21,25 @@
  * @see commerce_ogone_build_redirect_form()
  */
 function commerce_marketplace_ogone_commerce_ogone_data_alter(&$data, $order, $settings) {
-  // Marketplace-specific: load all orders from the current order group
-  // (for all vendors) and update request ORDERID value with IDs of all orders.
-  $orders = commerce_order_load_multiple(NULL, array('order_group' => $order->order_group), TRUE);
-  // We are using order IDs here instead of order numbers, as this way we can
-  // be sure that we always have to deal with integers, which could be easily
-  // split by separating dashes when receiving callback from Ogone
-  // (see commerce_marketplace_ogone_callback()).
-  ksort($orders);
-  $data['ORDERID'] = implode('-', array_keys($orders));
+  // All the updates below should be done only if payments are being sent to
+  // the main store (in which case we can use just one payment request for all
+  // orders from the order group). If payments are sent directly to merchants,
+  // this won't be possible, as Ogone doesn't support any kind of parallel payments.
+  if (variable_get('commerce_store_payment_mode', COMMERCE_MARKETPLACE_PAYMENT_DEFAULT_MODE) == 'main_store') {
+    // Marketplace-specific: load all orders from the current order group
+    // (for all vendors) and update request ORDERID value with IDs of all orders.
+    $orders = commerce_order_load_multiple(NULL, array('order_group' => $order->order_group), TRUE);
+    // We are using order IDs here instead of order numbers, as this way we can
+    // be sure that we always have to deal with integers, which could be easily
+    // split by separating dashes when receiving callback from Ogone
+    // (see commerce_marketplace_ogone_callback()).
+    ksort($orders);
+    $data['ORDERID'] = implode('-', array_keys($orders));
 
-  // Calculate total amount for all orders and update it in Ogone request.
-  $total = commerce_marketplace_order_calculate_total($orders);
-  $data['AMOUNT'] = $total['amount'];
+    // Calculate total amount for all orders and update it in Ogone request.
+    $total = commerce_marketplace_order_calculate_total($orders);
+    $data['AMOUNT'] = $total['amount'];
+  }
 }
 
 
@@ -84,7 +90,17 @@ function commerce_marketplace_ogone_redirect_form_validate($order, $payment_meth
       // Process the transaction based on the Ogone parameters received.
       // Marketplace-specific: use commerce_marketplace_ogone_process_transaction()
       // instead of original commerce_ogone_process_transaction().
-      commerce_marketplace_ogone_process_transaction($order, $payment_method, $feedback);
+      // Also, when payments are being sent directly to merchants - considering
+      // than Ogone doesn't support parallel payments of any kind - it means
+      // that a payment could be done for single orders only, therefore we need
+      // to check make sure we process only those order which have Ogone as
+      // selected payment method.
+      if (
+        !empty($order->data['payment_method'])
+        && $order->data['payment_method'] == $payment_method['instance_id']
+      ) {
+        commerce_marketplace_ogone_process_transaction($order, $payment_method, $feedback);
+      }
       return TRUE;
     }
   }
